@@ -1,61 +1,79 @@
-# 1024terabox
+# 1024 Share
 
-A research-first public-share extractor for 1024TeraBox / TeraBox-compatible public links.
+A research-first public-share explorer for 1024TeraBox / TeraBox-compatible public links.
 
-## Goal
+Paste a public share URL, inspect the real folder tree, then resolve a playable URL only for the file you select.
 
-Build a clean extractor that can inspect public shares, preserve folder structure, list files, and resolve a selected media/download URL when the public-share flow legitimately exposes one.
+## What this is not
 
-The project is intentionally designed to avoid advertising/interstitial dependencies. A reference service may use ads or waiting pages; those are not part of this project's architecture.
+This is not a clone of [1024teradl.com](https://1024teradl.com/). That site’s Cloudflare “security verification” / CAPTCHA belongs to the third-party website, not to TeraBox’s public-share API. This project does not copy ads, waiting pages, tracking, or CAPTCHA solving.
 
-## Reference material
+## Confirmed public-share flow
 
-- Reference service: https://1024teradl.com/
-- Sample public share: https://1024terabox.com/s/1qwJxYQ8hWfs1Sm7JeNrC6w
-
-The reference service currently presents a CAPTCHA/security-verification step in some flows. That behavior must be documented and respected rather than blindly copied or defeated.
-
-## Architecture
+Observed against TeraBox’s own web player (`www.terabox.app` / `www.1024tera.com`) with Playwright + live HTTP:
 
 ```text
 Public share URL
-      ↓
-Share metadata
-      ↓
-Root listing
-      ↓
-Folder navigation
-      ↓
-File metadata
-      ↓
-Selected-file media/download resolution
+      ↓  GET /sharing/link?surl=…
+Share page HTML (jsToken, pcftoken, browserid cookie)
+      ↓  GET /api/shorturlinfo?shorturl=1{surl}&root=1
+Share metadata (shareid, uk, sign, timestamp, errno)
+      ↓  GET /share/list?shorturl={surl}&root=1|dir=…
+Current-folder listing (files + folders only)
+      ↓  user selects a video
+GET /share/streaming  (HMAC-SHA1 over clienttype+channel+browserid+timestamp)
 ```
 
-Media URLs should be resolved lazily. Initial discovery should not attempt to resolve every video in a large folder.
+`1024terabox.com/s/1{id}` redirects to `www.terabox.app/sharing/link?surl={id}`.
+`www.1024terabox.com/s/1{id}` redirects to `www.1024tera.com/sharing/link?surl={id}`.
 
-## Folder behavior
+### Endpoints (web, unauthenticated)
 
-- Multiple folders at the current level → show the folders.
-- Exactly one folder and no files → automatically enter it.
-- Files at the current level → show the files.
-- Nested folders → preserve the hierarchy.
+| Stage | Method | Path | Notes |
+| --- | --- | --- | --- |
+| Page | GET | `/sharing/link?surl=` | Sets `csrfToken`, `browserid`, `TSID`. Embeds `jsToken`. |
+| Metadata | GET | `/api/shorturlinfo` | `shorturl` **with** leading `1`. |
+| Listing | GET | `/share/list` | `shorturl` **without** leading `1`. `root=1` or `dir=/path&root=0`. |
+| Password | POST | `/share/verify` | `pwd`. errno `-9` if still locked. |
+| Stream | GET | `/share/streaming` | Public player HMAC. Returns HLS. |
+| Download | POST | `/share/download` | Often errno `2` without a TeraBox login. Reported as a limitation. |
 
-## Security and limitations
+HTTP 200 is not success. The JSON `errno` field is the semantic result.
 
-Only public-share resources that are legitimately accessible without account authentication should be handled.
+### errno (observed)
 
-Do not:
+| errno | Meaning |
+| --- | --- |
+| 0 | Success |
+| -4 / 116 | Deleted / not found |
+| -9 | Password-protected |
+| 2 | Invalid parameters |
+| 130 | Requested stream quality unavailable |
+| 4000020 / 400141 | Security verification |
 
-- expose cookies, credentials, or private session data;
-- commit secrets;
-- bypass account authentication;
-- solve or defeat CAPTCHA/security verification;
-- reproduce ad redirects, forced waiting pages, or tracking mechanisms.
+The sample `https://1024terabox.com/s/1qwJxYQ8hWfs1Sm7JeNrC6w` is deleted on TeraBox itself (`errno -4`, official UI: “Sorry, this content has been deleted”).
 
-If a public share requires a CAPTCHA or other security verification, return a clear limitation/error instead of attempting to circumvent it.
+## Folder rules
 
-## Development principles
+- Multiple folders → show folders
+- Exactly one folder and no files → enter it
+- Files present → show files (and folders if mixed)
+- Never flatten the whole share
 
-Research the actual browser/network flow before implementing undocumented endpoints. Do not guess endpoint names repeatedly. Validate response schemas, keep modules small, and run the build/typecheck before committing.
+Media URLs are resolved lazily when a file is clicked.
 
-See [GROK.md](./GROK.md) for the implementation/research instructions for Grok.
+## Security
+
+- Public shares only
+- No account cookies, no CAPTCHA solving, no private file access
+- Temporary page tokens stay on the server and are not logged
+- Stream proxy only allows TeraBox CDN / share hosts
+
+## Development
+
+```sh
+npm run dev
+npm test
+npm run typecheck
+npm run build
+```

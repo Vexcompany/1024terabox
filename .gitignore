@@ -1,0 +1,15 @@
+node_modules
+.vercel
+dist
+.output
+.nitro
+.tanstack
+.grok/preview.log
+.grok/og-pending
+screenshots
+artifacts
+*.log
+.DS_Store
+src/routeTree.gen.ts
+.env
+.env.*
