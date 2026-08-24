@@ -10,13 +10,17 @@ import type { ShareSession } from "./types.ts";
  */
 const STREAM_HMAC_KEY = "iuuPc64E4Fhn0rTXEzrnbLph0o5qyEEa";
 
+// Try the higher-quality variants first, but do not assume the first successful
+// playlist is the complete stream. Some public-share responses can expose a
+// short preview playlist for one variant while another variant contains the
+// full available public stream.
 const STREAM_TYPES = [
+  "M3U8_AUTO_1080",
+  "M3U8_AUTO_720",
   "M3U8_AUTO_480",
   "M3U8_AUTO_360",
   "M3U8_FLV_264_480",
   "M3U8_FLV_264_360",
-  "M3U8_AUTO_720",
-  "M3U8_AUTO_1080",
 ] as const;
 
 function streamSign(browserid: string, timestamp: string): string {
@@ -28,12 +32,25 @@ function looksLikeM3u8(text: string): boolean {
   return text.trimStart().startsWith("#EXTM3U");
 }
 
+function playlistDuration(text: string): number {
+  if (!looksLikeM3u8(text)) return 0;
+  let total = 0;
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.startsWith("#EXTINF:")) continue;
+    const value = Number.parseFloat(line.slice(8).split(",", 1)[0] ?? "");
+    if (Number.isFinite(value)) total += value;
+  }
+  return total;
+}
+
 export async function resolveStreamUrl(session: ShareSession, fsId: string): Promise<string | null> {
   const browserid = session.cookies.browserid || "";
   if (!browserid || !session.shareId || !session.uk) return null;
   const timestamp = String(Math.floor(Date.now() / 1000));
   const sign = streamSign(browserid, timestamp);
   const referer = `${session.origin}/sharing/link?surl=${session.surl}`;
+
+  const candidates: Array<{ url: string; duration: number; type: string }> = [];
 
   for (const type of STREAM_TYPES) {
     const url = withQuery(`${session.origin}/share/streaming`, {
@@ -48,16 +65,31 @@ export async function resolveStreamUrl(session: ShareSession, fsId: string): Pro
       isplayer: "1",
       ehps: "1",
     });
-    const res = await requestRaw(url, session.cookies, referer);
-    if (looksLikeM3u8(res.raw)) return url;
+
     try {
-      const parsed = JSON.parse(res.raw) as { errno?: number };
-      if (Number(parsed.errno) === 130) continue;
+      const res = await requestRaw(url, session.cookies, referer);
+      if (looksLikeM3u8(res.raw)) {
+        candidates.push({ url, duration: playlistDuration(res.raw), type });
+        continue;
+      }
+      try {
+        const parsed = JSON.parse(res.raw) as { errno?: number };
+        if (Number(parsed.errno) === 130) continue;
+      } catch {
+        // Ignore non-JSON/non-M3U8 variants and continue probing.
+      }
     } catch {
-      continue;
+      // A single unavailable quality must not prevent another public variant
+      // from being selected.
     }
   }
-  return null;
+
+  if (!candidates.length) return null;
+
+  // Prefer the playlist advertising the longest duration. When durations are
+  // equal, preserve the STREAM_TYPES quality order above.
+  candidates.sort((a, b) => b.duration - a.duration);
+  return candidates[0]?.url ?? null;
 }
 
 export async function resolveDownloadUrl(session: ShareSession, fsId: string): Promise<string | null> {
@@ -91,9 +123,7 @@ export async function resolveDownloadUrl(session: ShareSession, fsId: string): P
     const dlink = res.json.dlink || res.json.list?.[0]?.dlink;
     return dlink || null;
   }
-  if (Number(res.json.errno) === 2) {
-    return null;
-  }
+  if (Number(res.json.errno) === 2) return null;
   throw mapErrno(res.json.errno, "media_resolution_failed", "Could not resolve a download URL.");
 }
 
