@@ -7,16 +7,19 @@ function proxied(url: string): string {
   return `/api/proxy?u=${encodeURIComponent(url)}`;
 }
 
+function playbackSource(url: string): string {
+  return url.startsWith("/") ? url : proxied(url);
+}
+
 export function MediaPlayer({ media }: { media: MediaSuccess }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [error, setError] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
 
-  // A public `directUrl` is the full-file download path. The HLS URL is only
-  // a playback fallback because public streaming endpoints can expose a short
-  // preview even when a full dlink is available for the same file.
-  const playbackUrl = media.directUrl || media.streamUrl;
-  const isHls = !media.directUrl && Boolean(media.streamUrl);
+  // Playback uses the merged HLS collector first. The direct URL remains
+  // available for downloading, but public dlinks can point at a short preview.
+  const playbackUrl = media.streamUrl || media.directUrl;
+  const isHls = Boolean(media.streamUrl);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -24,7 +27,7 @@ export function MediaPlayer({ media }: { media: MediaSuccess }) {
     setError(null);
     setReady(false);
 
-    const src = proxied(playbackUrl);
+    const src = playbackSource(playbackUrl);
     let hls: { destroy: () => void } | null = null;
     let cancelled = false;
 
@@ -49,7 +52,11 @@ export function MediaPlayer({ media }: { media: MediaSuccess }) {
       const Hls = (await import("hls.js")).default;
       if (cancelled) return;
       if (Hls.isSupported()) {
-        const instance = new Hls({ enableWorker: true });
+        const instance = new Hls({
+          enableWorker: true,
+          maxBufferLength: 60,
+          maxMaxBufferLength: 120,
+        });
         instance.loadSource(src);
         instance.attachMedia(video);
         instance.on(Hls.Events.MANIFEST_PARSED, () => {
@@ -98,7 +105,7 @@ export function MediaPlayer({ media }: { media: MediaSuccess }) {
               Download
             </Button>
           ) : media.streamUrl ? (
-            <Button variant="secondary" onClick={() => window.open(proxied(media.streamUrl!), "_blank")}>
+            <Button variant="secondary" onClick={() => window.open(media.streamUrl!, "_blank")}>
               Open stream
             </Button>
           ) : null}
