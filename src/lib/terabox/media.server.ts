@@ -3,11 +3,6 @@ import { mapErrno, ShareError } from "./errors.ts";
 import { commonQuery, requestJson, requestRaw, withQuery } from "./http.server.ts";
 import type { ShareSession } from "./types.ts";
 
-/**
- * Public HMAC key from TeraBox's own web-share player bundle
- * (`crypto-vendor` export HmacSHA1, default key in `shareLink.js`).
- * This is a client-side player signing key, not an account credential.
- */
 const STREAM_HMAC_KEY = "iuuPc64E4Fhn0rTXEzrnbLph0o5qyEEa";
 
 const STREAM_TYPES = [
@@ -75,12 +70,7 @@ function parseSegments(text: string): StreamSegment[] {
 
     const range = parseRange(line);
     if (range) {
-      segments.push({
-        duration,
-        url: line,
-        rangeStart: range.start,
-        rangeEnd: range.end,
-      });
+      segments.push({ duration, url: line, rangeStart: range.start, rangeEnd: range.end });
     }
     duration = null;
   }
@@ -89,10 +79,8 @@ function parseSegments(text: string): StreamSegment[] {
 }
 
 /**
- * TeraBox's public /share/streaming endpoint can return only one internal
- * video chunk per request. A single playlist therefore may look valid while
- * still ending early. Collect several independently signed playlists and
- * stitch their signed TS URLs into one VOD playlist.
+ * The public streaming endpoint can expose one internal TS chunk per request.
+ * Poll it repeatedly and stitch the signed TS URLs into one VOD playlist.
  */
 export async function resolveMergedStreamPlaylist(
   session: ShareSession,
@@ -101,15 +89,16 @@ export async function resolveMergedStreamPlaylist(
   const browserid = session.cookies.browserid || "";
   if (!browserid || !session.shareId || !session.uk) return null;
 
-  const timestamp = String(Math.floor(Date.now() / 1000));
-  const sign = streamSign(browserid, timestamp);
   const referer = `${session.origin}/sharing/link?surl=${session.surl}`;
-  const type = STREAM_TYPES[0];
-  const baseUrl = `${session.origin}/share/streaming`;
+  const byRange = new Map<string, StreamSegment>();
 
-  const responses = await Promise.all(
-    Array.from({ length: 8 }, (_, index) => {
-      const url = withQuery(baseUrl, {
+  // Keep the same request shape that TeraBox's web player uses. The endpoint
+  // chooses the internal chunk; repeated calls discover the remaining chunks.
+  for (const type of STREAM_TYPES.slice(0, 4)) {
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const timestamp = String(Math.floor(Date.now() / 1000));
+      const sign = streamSign(browserid, timestamp);
+      const url = withQuery(`${session.origin}/share/streaming`, {
         ...commonQuery(session),
         uk: session.uk,
         shareid: session.shareId,
@@ -120,26 +109,32 @@ export async function resolveMergedStreamPlaylist(
         esl: "1",
         isplayer: "1",
         ehps: "1",
-        probe: `${Date.now()}-${index}-${Math.random().toString(36).slice(2)}`,
+        start: "0",
       });
-      return requestRaw(url, session.cookies, referer).catch(() => null);
-    }),
-  );
 
-  const byRange = new Map<string, StreamSegment>();
-  for (const response of responses) {
-    if (!response || !looksLikeM3u8(response.raw)) continue;
-    for (const segment of parseSegments(response.raw)) {
-      const key = `${segment.rangeStart}-${segment.rangeEnd}`;
-      if (!byRange.has(key)) byRange.set(key, segment);
+      try {
+        const response = await requestRaw(url, session.cookies, referer);
+        if (!looksLikeM3u8(response.raw)) continue;
+        for (const segment of parseSegments(response.raw)) {
+          const key = `${segment.rangeStart}-${segment.rangeEnd}`;
+          if (!byRange.has(key)) byRange.set(key, segment);
+        }
+      } catch {
+        // Keep probing; a transient upstream response should not discard
+        // chunks already discovered from earlier requests.
+      }
     }
+
+    // If a quality produced useful chunks, do not hammer all lower qualities
+    // unless the collector found nothing at all.
+    if (byRange.size > 0) break;
   }
 
   const segments = [...byRange.values()].sort((a, b) => a.rangeStart - b.rangeStart);
   if (!segments.length) return null;
 
   const targetDuration = Math.max(1, Math.ceil(Math.max(...segments.map((s) => s.duration))));
-  const body = [
+  return [
     "#EXTM3U",
     `#EXT-X-TARGETDURATION:${targetDuration}`,
     "#EXT-X-PLAYLIST-TYPE:VOD",
@@ -148,8 +143,6 @@ export async function resolveMergedStreamPlaylist(
     "#EXT-X-ENDLIST",
     "",
   ].join("\n");
-
-  return body;
 }
 
 export async function resolveStreamUrl(session: ShareSession, fsId: string): Promise<string | null> {
@@ -185,11 +178,10 @@ export async function resolveStreamUrl(session: ShareSession, fsId: string): Pro
         const parsed = JSON.parse(res.raw) as { errno?: number };
         if (Number(parsed.errno) === 130) continue;
       } catch {
-        // Ignore non-JSON/non-M3U8 variants and continue probing.
+        // Ignore non-JSON/non-M3U8 variants.
       }
     } catch {
-      // A single unavailable quality must not prevent another public variant
-      // from being selected.
+      // Continue probing other qualities.
     }
   }
 
