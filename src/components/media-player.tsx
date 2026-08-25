@@ -12,14 +12,38 @@ export function MediaPlayer({ media }: { media: MediaSuccess }) {
   const [error, setError] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
 
+  // A public `directUrl` is the full-file download path. The HLS URL is only
+  // a playback fallback because public streaming endpoints can expose a short
+  // preview even when a full dlink is available for the same file.
+  const playbackUrl = media.directUrl || media.streamUrl;
+  const isHls = !media.directUrl && Boolean(media.streamUrl);
+
   useEffect(() => {
     const video = videoRef.current;
-    if (!video || !media.streamUrl) return;
+    if (!video || !playbackUrl) return;
     setError(null);
     setReady(false);
-    const src = proxied(media.streamUrl);
+
+    const src = proxied(playbackUrl);
     let hls: { destroy: () => void } | null = null;
     let cancelled = false;
+
+    if (!isHls) {
+      video.src = src;
+      const onLoadedMetadata = () => setReady(true);
+      const onError = () => setError("Playback failed. Try using Download instead.");
+      video.addEventListener("loadedmetadata", onLoadedMetadata);
+      video.addEventListener("error", onError);
+      void video.play().catch(() => undefined);
+      return () => {
+        cancelled = true;
+        video.pause();
+        video.removeAttribute("src");
+        video.load();
+        video.removeEventListener("loadedmetadata", onLoadedMetadata);
+        video.removeEventListener("error", onError);
+      };
+    }
 
     (async () => {
       const Hls = (await import("hls.js")).default;
@@ -48,11 +72,11 @@ export function MediaPlayer({ media }: { media: MediaSuccess }) {
       cancelled = true;
       hls?.destroy();
     };
-  }, [media.streamUrl]);
+  }, [playbackUrl, isHls]);
 
   return (
     <section className="overflow-hidden rounded-[var(--radius-xl)] border border-border bg-card">
-      {media.streamUrl ? (
+      {playbackUrl ? (
         <div className="relative aspect-video bg-background">
           <video ref={videoRef} className="size-full" controls playsInline />
           {!ready && !error ? (
