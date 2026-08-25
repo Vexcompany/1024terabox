@@ -142,8 +142,12 @@ export async function resolveMedia(
       throw new ShareError("file_metadata_failed", "That file is not in this public share.");
     }
 
-    const streamUrl =
+    const upstreamStreamUrl =
       file.mediaType === "video" || file.mediaType === "audio" ? await resolveStreamUrl(session, fsId) : null;
+    const streamUrl = upstreamStreamUrl
+      ? `/api/stream?url=${encodeURIComponent(url)}&fsId=${encodeURIComponent(fsId)}${password ? `&password=${encodeURIComponent(password)}` : ""}`
+      : null;
+
     let directUrl: string | null = null;
     try {
       directUrl = await resolveDownloadUrl(session, fsId);
@@ -213,6 +217,7 @@ export function proxyAllowed(url: string): boolean {
       host.endsWith("terabox.app") ||
       host.endsWith("terabox.com") ||
       host.endsWith("teraboxcdn.com") ||
+      host.endsWith("teraboxpage.com") ||
       host.endsWith("1024tera.com") ||
       host.endsWith("1024terabox.com") ||
       host.endsWith("terabox.co")
