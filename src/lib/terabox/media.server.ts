@@ -52,6 +52,15 @@ function parseRange(url: string): { start: number; end: number } | null {
   }
 }
 
+function parseTsSize(url: string): number | null {
+  try {
+    const value = Number(new URL(url).searchParams.get("ts_size") || "");
+    return Number.isFinite(value) && value > 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
 function parseSegments(text: string): StreamSegment[] {
   const lines = text.split(/\r?\n/);
   const segments: StreamSegment[] = [];
@@ -78,9 +87,22 @@ function parseSegments(text: string): StreamSegment[] {
   return segments;
 }
 
+function hasCompleteCoverage(segments: StreamSegment[], tsSize: number | null): boolean {
+  if (!segments.length || tsSize === null) return false;
+  const ordered = [...segments].sort((a, b) => a.rangeStart - b.rangeStart);
+  let cursor = 0;
+  for (const segment of ordered) {
+    if (segment.rangeStart > cursor) return false;
+    if (segment.rangeEnd + 1 > cursor) cursor = segment.rangeEnd + 1;
+    if (cursor >= tsSize) return true;
+  }
+  return cursor >= tsSize;
+}
+
 /**
  * The public streaming endpoint can expose one internal TS chunk per request.
- * Poll it repeatedly and stitch the signed TS URLs into one VOD playlist.
+ * Poll it repeatedly and stitch every contiguous signed TS URL into one VOD
+ * playlist. A single response is not guaranteed to contain the full file.
  */
 export async function resolveMergedStreamPlaylist(
   session: ShareSession,
@@ -92,10 +114,13 @@ export async function resolveMergedStreamPlaylist(
   const referer = `${session.origin}/sharing/link?surl=${session.surl}`;
   const byRange = new Map<string, StreamSegment>();
 
-  // Keep the same request shape that TeraBox's web player uses. The endpoint
-  // chooses the internal chunk; repeated calls discover the remaining chunks.
-  for (const type of STREAM_TYPES.slice(0, 4)) {
-    for (let attempt = 0; attempt < 8; attempt += 1) {
+  for (const type of STREAM_TYPES) {
+    let tsSize: number | null = null;
+    let duplicateAttempts = 0;
+
+    // TeraBox can advance to another chunk on each request. Do not stop after
+    // an arbitrary 8 requests: a file can require substantially more chunks.
+    for (let attempt = 0; attempt < 48; attempt += 1) {
       const timestamp = String(Math.floor(Date.now() / 1000));
       const sign = streamSign(browserid, timestamp);
       const url = withQuery(`${session.origin}/share/streaming`, {
@@ -115,23 +140,35 @@ export async function resolveMergedStreamPlaylist(
       try {
         const response = await requestRaw(url, session.cookies, referer);
         if (!looksLikeM3u8(response.raw)) continue;
+
         for (const segment of parseSegments(response.raw)) {
           const key = `${segment.rangeStart}-${segment.rangeEnd}`;
-          if (!byRange.has(key)) byRange.set(key, segment);
+          if (byRange.has(key)) duplicateAttempts += 1;
+          else {
+            byRange.set(key, segment);
+            duplicateAttempts = 0;
+          }
+          tsSize ??= parseTsSize(segment.url);
         }
+
+        if (hasCompleteCoverage([...byRange.values()], tsSize)) break;
+        if (duplicateAttempts >= 4) break;
       } catch {
         // Keep probing; a transient upstream response should not discard
         // chunks already discovered from earlier requests.
       }
     }
 
-    // If a quality produced useful chunks, do not hammer all lower qualities
-    // unless the collector found nothing at all.
     if (byRange.size > 0) break;
   }
 
   const segments = [...byRange.values()].sort((a, b) => a.rangeStart - b.rangeStart);
   if (!segments.length) return null;
+
+  // Only expose a playlist when the byte ranges form one contiguous TS file.
+  // This prevents the player from receiving a silently truncated playlist.
+  const tsSize = parseTsSize(segments[0]?.url ?? "");
+  if (!hasCompleteCoverage(segments, tsSize)) return null;
 
   const targetDuration = Math.max(1, Math.ceil(Math.max(...segments.map((s) => s.duration))));
   return [
@@ -139,6 +176,7 @@ export async function resolveMergedStreamPlaylist(
     `#EXT-X-TARGETDURATION:${targetDuration}`,
     "#EXT-X-PLAYLIST-TYPE:VOD",
     "#EXT-X-VERSION:3",
+    "#EXT-X-DISCONTINUITY",
     ...segments.flatMap((segment) => [`#EXTINF:${segment.duration},`, segment.url]),
     "#EXT-X-ENDLIST",
     "",
